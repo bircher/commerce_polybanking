@@ -1,0 +1,398 @@
+<?php
+
+/**
+ * @file
+ * Provides a payment method using Postfinance through the Polybanking system.
+ */
+
+/**
+ * Implements hook_menu().
+ *
+ * adds the callback uri
+ */
+function commerce_polybanking_menu() {
+  $items = array();
+
+  // Define an always accessible path to receive IPNs.
+  $items['commerce_polybanking/ipn'] = array(
+    'page callback' => 'commerce_polybanking_process_ipn',
+    'page arguments' => array(3, null),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_polybanking_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['commerce_polybanking'] = array(
+    'base' => 'commerce_polybanking',
+    'title' => t('Postfinance via Polybanking'),
+    'short_title' => t('Polybanking'),
+    'display_title' => t('PostFinance (VISA / MasterCard / PostFinance e-finance / PostFinance Card)'),
+    'description' => t('Payment using Postfinance through the Polybanking system'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ *
+ * Settings form for the things Polybanking requires.
+ */
+function commerce_polybanking_settings_form($settings = NULL) {
+  $form = array();
+
+  $settings = (array) $settings + array(
+    'server_url' => '',
+    'config_id' => '',
+    'key_request' => '',
+    'key_api' => '',
+    'key_ipn' => ''
+  );
+
+  $form['server_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Server URL'),
+    '#description' => t('URL (<strong>with trailing slash</strong>) of the Polybanking server where requests should be sent to.'),
+    '#default_value' => $settings['server_url'],
+    '#required' => TRUE
+  );
+  $form['config_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Configuration ID'),
+    '#description' => t('ID of the config where the transactions should go to.'),
+    '#default_value' => $settings['config_id'],
+    '#required' => TRUE
+  );
+  $form['key_request'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Key for requests'),
+    '#description' => t('Secret key used to sign requests.'),
+    '#default_value' => $settings['key_request'],
+    '#required' => TRUE,
+    '#attributes' => array('autocomplete' => 'off'),
+  );
+  $form['key_api'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Key for API'),
+    '#description' => t('Secret key used to sign API access requests (optional). '),
+    '#default_value' => $settings['key_api'],
+    '#attributes' => array('autocomplete' => 'off'),
+  );
+  $form['key_ipn'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Key for IPN'),
+    '#description' => t('Secret key used to sign IPNs (Instant Payment Notifications). '),
+    '#default_value' => $settings['key_ipn'],
+    '#required' => TRUE,
+    '#attributes' => array('autocomplete' => 'off'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: submit form.
+ */
+/*function commerce_polybanking_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  // We don't require any other info in the submit form, everything is handled
+  // by polybanking, so return nothing
+  return '';
+}*/
+
+/**
+ * Payment method callback: submit form validation.
+ */
+/*function commerce_polybanking_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  // No form, nothing to validate, so return true
+  return TRUE;
+}*/
+
+/**
+ * Payment method callback: submit form submission.
+ */
+/*function commerce_polybanking_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+
+  return TRUE;
+
+  // // Just as an example, we might store information in the order object from the
+  // // payment parameters, though we would never save a full credit card number,
+  // // even in examples!
+  // $number = $pane_values['credit_card']['number'];
+  // $pane_values['credit_card']['number'] = substr($number, 0, 4) . str_repeat('-', strlen($number) - 8) . substr($number, -4);
+
+  // $order->data['commerce_polybanking'] = $pane_values;
+
+  // // Every attempted transaction should result in a new transaction entity being
+  // // created for the order to log either the success or the failure.
+  // commerce_polybanking_transaction($payment_method, $order, $charge);
+}*/
+
+/**
+ * Payment method callback: redirect form.
+ */
+function commerce_polybanking_redirect_form($form, &$form_state, $order, $payment_method) {
+
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['server_url'])) {
+    drupal_set_message(t('Postfinance via Polybanking (Method: @method) is not configured for use. No server URL has been specified.', array('@method' => $payment_method['instance_id'])), 'error');
+    return array();
+  }
+  if (empty($payment_method['settings']['key_request'])) {
+    drupal_set_message(t('Postfinance via Polybanking (Method: @method) is not configured for use. No key for requests has been specified.', array('@method' => $payment_method['instance_id'])), 'error');
+    return array();
+  }
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  if (isset($wrapper->commerce_order_total)) {
+    $total = array();
+    $total['amount'] = $wrapper->commerce_order_total->amount->value();
+  }
+  else {
+    // old style
+    $total = commerce_line_items_total($wrapper->commerce_line_items);
+  }
+
+  // Send request to Polybanking
+  $pb = new PolyBanking(
+    $payment_method['settings']['server_url'],
+    $payment_method['settings']['config_id'],
+    $payment_method['settings']['key_request'],
+    $payment_method['settings']['key_api'],
+    $payment_method['settings']['key_ipn']
+  );
+
+  $pb_result = $pb->new_transaction(
+    $total['amount'],
+    'test-reference' . '-order-' . $order->order_number
+  );
+  
+  if ($pb_result->status != 'OK') {
+    drupal_set_message(t('There was a problem creating a new transaction with Polybanking (status: @status).', array('@status' => $pb_result->status)), 'error');
+    return array();
+  }
+
+  // Create button leading to Polybanking redirector
+  $form['#action'] = $pb_result->url;
+  $form['#method'] = 'get';
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Do the payment'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ * 
+ * @param $order
+ *    The order object.
+ * @param $payment_method
+ *    The payment method to be used.
+ *
+ * @return
+ *    a boolean if the form is valid.
+ */
+/*function commerce_polybanking_redirect_form_validate($order, $payment_method) {
+  // Nothing much to check really
+  return FALSE;
+}*/
+
+/**
+ * Processes an incoming IPN.
+ *
+ * @param $debug_ipn
+ *   Optionally specify an IPN array for debug purposes; if left empty, the IPN
+ *     be pulled from the $_POST.
+ *
+ */
+function commerce_polybanking_process_ipn($rule_name, $debug_ipn = array()) {
+
+  //$debug_ipn = array('config' => 4, 'reference' => 'test-reference-812');
+
+  if (empty($debug_ipn)) {
+    $ipn = $_POST;
+  } else {
+    $ipn = $debug_ipn;
+  }
+
+  $ret = 'IPN failed';
+  if (commerce_polybanking_check_ipn($rule_name, $ipn)) {
+    $ret = 'IPN OK';
+  }
+
+  print $ret;
+
+
+
+  exit(0); // hook_exit will not be invoked !
+}
+
+/**
+ * Processes an incoming IPN.
+ *
+ * @param $ipn
+ *   The IPN object to be checked.
+ *
+ * @return
+ *   TRUE or FALSE indicating whether the IPN was successfully processed or not.
+ */
+function commerce_polybanking_check_ipn($rule_name, $ipn) {
+  if (!empty($ipn)) {
+
+    $method_id = 'commerce_polybanking|'."$rule_name";
+    $payment_method = commerce_payment_method_instance_load($method_id);
+
+    if ($payment_method == FALSE) {
+      watchdog('commerce_polybanking', 'payment_method could not be loaded (method_id: @method_id)', array('@method_id' => $method_id), WATCHDOG_ERROR);
+      //return FALSE;
+    }
+
+    $settings = $payment_method['settings'];
+    if (!is_array($settings) || empty($settings['key_ipn'])) {
+      watchdog('commerce_polybanking', 'payment_method is not configured properly (instance_id: @instance_id)', array('@instance_id' => $payment_method['instance_id']), WATCHDOG_ERROR);
+      return FALSE;
+    }
+
+    $orderid = explode('-order-', $ipn['reference']);
+    $orderid = isset($orderid[1]) ? $orderid[1] : '';
+    if (empty($orderid)) {
+      watchdog('commerce_polybanking', 'received IPN with empty order ID (reference: @reference)', array('@reference' => $ipn['reference']), WATCHDOG_ERROR);
+      return FALSE;
+    }
+
+    // Check with Polybanking client
+    $pb = new PolyBanking(
+      $settings['server_url'],
+      $settings['config_id'],
+      $settings['key_request'],
+      $settings['key_api'],
+      $settings['key_ipn']
+    );
+    $pb_result = $pb->check_ipn($ipn);
+    if (!$pb_result['is_ok']) {
+      watchdog('commerce_polybanking', 'received invalid IPN (status: @status)', array('@status' => $pb_result['message']), WATCHDOG_ERROR);
+      return FALSE;
+    }
+
+    // Valid IPN
+    watchdog('commerce_polybanking', 'received IPN callback (oid: @oid, postfinance_status_good: @pf_good, postfinance_status: @pf_status, last_update: @last_update)', array('@oid' => $orderid, '@pf_good' => $ipn['postfinance_status_good'], '@pf_status' => $ipn['postfinance_status'], '@last_update' => $ipn['last_update']), WATCHDOG_INFO);
+    $order = commerce_order_load($orderid);
+    $ipn['postfinance_status_good'] = $ipn['postfinance_status_good'] == 'True' ? true : false;
+
+    if (!$ipn['postfinance_status_good']) {  // Cancelled by user
+      commerce_order_status_update($order, 'canceled');
+    }
+
+    commerce_polybanking_transaction($payment_method, $order, $ipn);
+
+    return TRUE;
+
+  }
+  return FALSE;
+}
+
+/**
+ * Save the payment transaction for the order to the DB.
+ *
+ * @param $payment_method
+ *   The used payment method.
+ * @param $order
+ *   The order object.
+ * @param $response
+ *   The response param array.
+ * @param $transaction_status
+ *   The status of the transaction.
+ */
+function commerce_polybanking_transaction($payment_method, $order, $response) {
+  
+  $transaction = commerce_payment_transaction_new('commerce_polybanking', $order->order_id);
+  $transaction->status = $response['postfinance_status_good'] ? COMMERCE_PAYMENT_STATUS_SUCCESS : COMMERCE_PAYMENT_STATUS_FAILURE;
+
+  $statusTxt = commerce_polybanking_IPNStatusText($response['postfinance_status']);
+  if ($transaction->status == COMMERCE_PAYMENT_STATUS_FAILURE) {
+    watchdog('commerce_polybanking', 'IPN: Postfinance status not good (postfinance_status: @pf_status)', array('@pf_status' => $response['postfinance_status']), WATCHDOG_WARNING);
+  }
+
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $order->commerce_order_total[LANGUAGE_NONE][0]['amount'];
+  $transaction->currency_code = $order->commerce_order_total[LANGUAGE_NONE][0]['currency_code'];
+  $transaction->remote_id = $response['reference'];  // Here, "remote" is Polybanking
+  $transaction->remote_status = $response['postfinance_status'] . ': ' . $statusTxt . ' (status is good: ' . $response['postfinance_status_good'] . ')';
+
+  if ($transaction->status == COMMERCE_PAYMENT_STATUS_SUCCESS) {
+    $transaction->message = '@orderid: ' . $statusTxt;
+    commerce_payment_redirect_pane_next_page($order);
+  } elseif ($transaction->status == COMMERCE_PAYMENT_STATUS_FAILURE) {
+    $transaction->message = '@orderid: ' . $statusTxt;
+    commerce_payment_redirect_pane_previous_page($order);
+  }
+
+  $transaction->message_variables = array(
+    '@orderid' => $order->order_id
+  );
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Returns a string representation of the IPN status code.
+ *
+ * @return
+ *   an array
+ */
+function commerce_polybanking_IPNStatusText($s) {
+  switch ($s) :
+    case 0: return t('Incomplete or invalid');
+    case 1: return t('Cancelled by customer');
+    case 2: return t('Authorisation declined');
+    case 4: return t('Order stored');
+    case 40: return t('Stored waiting external result');
+    case 41: return t('Waiting for client payment');
+    case 5: return t('Authorised');
+    case 50: return t('Authorized waiting external result');
+    case 51: return t('Authorisation waiting');
+    case 52: return t('Authorisation not known');
+    case 55: return t('Standby');
+    case 56: return t('OK with scheduled payments');
+    case 57: return t('Not OK with scheduled payments');
+    case 59: return t('Authoris. to be requested manually');
+    case 6: return t('Authorised and cancelled');
+    case 61: return t('Author. deletion waiting');
+    case 62: return t('Author. deletion uncertain');
+    case 63: return t('Author. deletion refused');
+    case 64: return t('Authorised and cancelled');
+    case 7: return t('Payment deleted');
+    case 71: return t('Payment deletion pending');
+    case 72: return t('Payment deletion uncertain');
+    case 73: return t('Payment deletion refused');
+    case 74: return t('Payment deleted');
+    case 75: return t('Deletion processed by merchant');
+    case 8: return t('Refund');
+    case 81: return t('Refund pending');
+    case 82: return t('Refund uncertain');
+    case 83: return t('Refund refused');
+    case 84: return t('Payment declined by the acquirer');
+    case 85: return t('Refund processed by merchant');
+    case 9: return t('Payment requested');
+    case 91: return t('Payment processing');
+    case 92: return t('Payment uncertain');
+    case 93: return t('Payment refused');
+    case 94: return t('Refund declined by the acquirer');
+    case 95: return t('Payment processed by merchant');
+    case 99: return t('Being processed');
+
+    default: return t('unkown status code');
+  endswitch;
+}
